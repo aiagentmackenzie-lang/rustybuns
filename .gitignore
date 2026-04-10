@@ -1,0 +1,24 @@
+# Rust implant build artifacts
+implant/target/
+
+# Bun dependencies
+controller/node_modules/
+
+# SQLite databases
+*.db
+
+# Logs and telemetry
+*.log
+*.log.*
+*.jsonl
+nohup.out
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.log.*
