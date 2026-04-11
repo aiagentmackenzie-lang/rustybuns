@@ -180,3 +180,7 @@ RustyBuns is designed for **authorized offensive security research only**.
 ## License
 
 Apache 2.0 — see LICENSE file.
+
+## Collaborations
+
+Feel free to contribute, improve or expand on this project.
