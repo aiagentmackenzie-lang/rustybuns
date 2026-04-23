@@ -11,9 +11,17 @@ pub struct HttpsTransport {
 
 impl HttpsTransport {
     pub fn new(base_url: &str) -> Self {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .timeout(Duration::from_secs(30))
+        let insecure: bool = std::env::var("C2_INSECURE")
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("1");
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30));
+        if insecure {
+            eprintln!("[WARN] C2_INSECURE=1 set — TLS certificate validation is DISABLED. This is dangerous.");
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        let client = builder
             .build()
             .expect("failed to create HTTP client");
         Self {

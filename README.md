@@ -98,7 +98,8 @@ curl -X POST http://localhost:8080/cmd -d 'shutdown'
 | `cred-access-check` | T1003 | List credential store paths (metadata-only) |
 | `list-env` | T1082 | Environment variable keys |
 | `list-ssh` | T1082 | SSH directory (metadata-only) |
-| `collect <path>` | T1074 | Bounded file collection |
+| `collect <path>` | T1074 | Enumerate file metadata (names, sizes) within scope |
+| `enumerate <path>` | T1082 | Alias for `collect` — enumerate file metadata (names, sizes) within scope |
 
 ## Scope Enforcement
 

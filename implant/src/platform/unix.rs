@@ -28,19 +28,21 @@ impl Platform for UnixPlatform {
 
     fn ps(&self) -> Result<Vec<ProcessEntry>, TaskError> {
         let output = Command::new("ps")
-            .args(["aux", "--no-headers"])
+            .args(["-eo", "pid,pcpu,user,comm="])
             .output()
             .map_err(|e| TaskError::CommandFailed(e.to_string()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut processes = Vec::new();
         for line in stdout.lines() {
-            let parts: Vec<&str> = line.splitn(11, ' ').filter(|s| !s.is_empty()).collect();
-            if parts.len() >= 3 {
-                let pid: u32 = parts[1].parse().unwrap_or(0);
-                let cpu: Option<f64> = parts[2].parse().ok();
-                let user = Some(parts[0].to_string());
-                let name = parts[10..].join(" ");
+            let parts: Vec<&str> = line.splitn(4, |c: char| c.is_whitespace())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() >= 4 {
+                let pid: u32 = parts[0].parse().unwrap_or(0);
+                let cpu: Option<f64> = parts[1].parse().ok();
+                let user = Some(parts[2].to_string());
+                let name = parts[3].to_string();
                 processes.push(ProcessEntry {
                     pid,
                     name,

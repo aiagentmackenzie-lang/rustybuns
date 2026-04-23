@@ -47,7 +47,7 @@ impl Task {
             "cred-access-check" => Ok(Task::CredAccessCheck),
             "list-env" => Ok(Task::ListEnv),
             "list-ssh" => Ok(Task::ListSsh),
-            "collect" => Ok(Task::Collection(
+            "collect" | "enumerate" => Ok(Task::Collection(
                 args.first().cloned().unwrap_or_else(|| "/".to_string()),
             )),
             "__shutdown" => Ok(Task::Shutdown),

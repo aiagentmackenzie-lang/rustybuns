@@ -10,9 +10,6 @@ pub struct ProcessEntry {
 pub enum TaskError {
     CommandFailed(String),
     NotFound,
-    PermissionDenied,
-    InvalidArgs(String),
-    Unsupported(String),
 }
 
 impl std::fmt::Display for TaskError {
@@ -20,9 +17,6 @@ impl std::fmt::Display for TaskError {
         match self {
             TaskError::CommandFailed(s) => write!(f, "command failed: {}", s),
             TaskError::NotFound => write!(f, "command not found"),
-            TaskError::PermissionDenied => write!(f, "permission denied"),
-            TaskError::InvalidArgs(s) => write!(f, "invalid arguments: {}", s),
-            TaskError::Unsupported(s) => write!(f, "unsupported: {}", s),
         }
     }
 }

